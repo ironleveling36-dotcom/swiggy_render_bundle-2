@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: swiggy-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python swiggy_bot.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: STATS_FILE
+        value: bot_stats.json
